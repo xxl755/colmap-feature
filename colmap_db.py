@@ -5,6 +5,23 @@ import cv2
 import os
 import itertools
 import matplotlib.pyplot as plt
+import time
+
+
+def operate(cmd):
+    print(cmd)
+    start = time.perf_counter()
+    os.system(cmd)#删除.db文件
+    end = time.perf_counter()
+    duration = end - start
+    print("[%s] cost %f s" % (cmd, duration))
+
+def geometric_verification(database_path, match_list_path):
+    print("Running geometric verification..................................")
+    cmd = "colmap matches_importer --database_path %s --match_list_path %s --match_type pairs" % (
+        database_path, match_list_path
+    )
+    operate(cmd)
 
 def init_database(paths):
     path=os.path.join(paths,"men.db")
@@ -29,27 +46,36 @@ def import_db(images_id,paths):
     conn=sqlite3.connect(path)
     cursor=conn.cursor()
 
-    des_list=[]
+    match_info_dict={}
     for idx,image in images_id.items():
+        kps_dict={}
+        des_dict={}
+        
         image_path=os.path.join(paths+"/imagetest",image)
         img=cv2.imread(image_path,cv2.IMREAD_GRAYSCALE)
         # cv2.imshow("window",img)
         # cv2.waitKey()
-        sift=cv2.SIFT_create(12000)
+        sift=cv2.SIFT_create(2000)
         # orb=cv2.ORB_create()
         kp_s,des_s=sift.detectAndCompute(img,None)
         # kp_o,des_o=orb.detectAndCompute(img,None)
-        des_list.append(des_s)
+
+        # des_list.append(des_s)
         # print(len(kp_s))
         # print(len(kp_o))
         des_s=np.array(des_s)
         kp_list=[]
         for kp in kp_s:
-            kp_list.append([kp.pt[0],kp.pt[1],kp.size,kp.angle])#像素坐标，尺度，主方向
+            kp_list.append([kp.pt[0],kp.pt[1]])
+            # kp_list.append([kp.pt[0],kp.pt[1],kp.size,kp.angle])#像素坐标，尺度，主方向
             #保留xy坐标
-        kp_list=np.array(kp_list).reshape(-1,4)
+        kp_list=np.array(kp_list)#.reshape(-1,4)
         kp_list=kp_list[:,:2]
-  
+
+        des_dict["des"]=des_s
+        kps_dict["kps"]=kp_list
+        match_info_dict[image]=des_dict,kps_dict
+
         kp_data=np.concatenate([kp_list,np.ones([kp_list.shape[0],1]),np.zeros([kp_list.shape[0],1])],axis=1).astype(np.float32)
         kp_data_str=kp_data.tostring()
         sql="INSERT INTO keypoints (image_id,rows,cols,data)VALUES(?,?,?,?);"
@@ -63,30 +89,35 @@ def import_db(images_id,paths):
     cursor.close()
     conn.close()
 
-    return des_list
+    return match_info_dict
 
 
-def get_matches(path,des_list,pair_id):
+def get_matches(path,match_info_dict,pair_id,match_list_path):
     DB_path=os.path.join(path,"men.db")
     conn=sqlite3.connect(DB_path)
     cursor=conn.cursor()
-    pair_list=[]
+    # pair_list=[]
     match_dict={}
 
-    for id in pair_id:
-        pair=(id//2147483647,id%2147483647,id)# 列表不能做dict的key
-        # pair.append(id//2147483647)
-        # pair.append(id%2147483647)
-        pair_list.append(pair) 
+    # for id in pair_id:
+    #     pair=(id//2147483647,id%2147483647,id)# 列表不能做dict的key
+    #     # pair.append(id//2147483647)
+    #     # pair.append(id%2147483647)
+    #     pair_list.append(pair) 
+    match_list = open(match_list_path, 'w')
 
-    
+    for pairs in pair_id.values():
+        match_list.write("%s %s\n" % (pairs[0], pairs[1]))
+
+    match_list.close()
+
     FLANN_INDEX_KDTREE=0
     indexParams=dict(algorithm=FLANN_INDEX_KDTREE,trees=5)
     searchParams= dict(checks=50)
 
-    for id, pair in enumerate(pair_list):
-        des1=des_list[pair[0]-1]
-        des2=des_list[pair[1]-1]
+    for id, img_pair in pair_id.items():
+        des1=match_info_dict[img_pair[0]][0]["des"]
+        des2=match_info_dict[img_pair[1]][0]["des"]
         flann=cv2.FlannBasedMatcher(indexParams,searchParams)
         matches=flann.knnMatch(des1,des2,2)
         match_info=[]
@@ -106,17 +137,17 @@ def get_matches(path,des_list,pair_id):
                 match_info.append((matches[idx][0].distance,matches[idx][0].queryIdx,matches[idx][0].trainIdx))#保留匹配最好的数据
                 idx+=1
             
-        match_info=np.array(sorted(match_info))[:,1:].astype(np.int16)#按照距离排序，并去除距离信息\
+        match_info=np.array(match_info)[:,1:].astype(np.int16)#按照距离排序，并去除距离信息\
 
         # pair_idx=list(pair_id.keys())[id]
-        pair_idx=pair_list[id]
-        match_dict[pair_idx]=match_info#.tolist()
+        # pair_idx=pair_list[id]
+        match_dict[id]=match_info#.tolist()
         matches_str=match_info.tostring()
 
         # pair_idx=2147483647*pair[0]+pair[1]
         # print(list(pair_id.keys())[id])
         cursor.execute("INSERT INTO matches(pair_id, rows, cols, data) VALUES(?, ?, ?, ?);",
-                   (list(pair_id.keys())[id], match_info.shape[0], match_info.shape[1], matches_str))
+                   (id, match_info.shape[0], match_info.shape[1], matches_str))
     conn.commit()
     cursor.close()
     conn.close()
@@ -158,9 +189,9 @@ def add_two_views_geometry(match_dict_item,db_path,F=np.eye(3), E=np.eye(3), H=n
   
     key,value=match_dict_item
     assert (value.shape[1]==2)
-    if key[0]>key[1]:
-        value=value[:,::-1]#交换匹配组内两点索引
-    pair_id=key[2]
+    # if key[0]>key[1]:
+    #     value=value[:,::-1]#交换匹配组内两点索引
+    pair_id=key
     value_str=value.tostring()    
     F=np.asarray(F,dtype=np.float64).tostring()
     E=np.asarray(E,dtype=np.float64).tostring()
@@ -238,15 +269,16 @@ if __name__=="__main__":
     #     img_list.append(file)
     # # print(len(img_list))
     path="/home/xxl/桌面/men"
+    match_list_path=os.path.join(path,"image_pairs_to_match.txt")
     init_database(path)
     img_id_dict=connect_img_id(path)
     pair_id=image_to_pair_id(img_id_dict)
-    des_list=import_db(img_id_dict,path)
-    match_dict=get_matches(path,des_list,pair_id)
-    for item in match_dict.items():
-        add_two_views_geometry(item,path)
-    
-
+    match_info_dict=import_db(img_id_dict,path)
+    match_dict=get_matches(path,match_info_dict,pair_id,match_list_path)
+    # for item in match_dict.items():
+    #     add_two_views_geometry(item,path)
+    database_path=os.path.join(path,"men.db")
+    geometric_verification(database_path, match_list_path)
     print("modify to github")
     # draw_match_point(img_id_dict,list(match_dict.items())[2],file_path)
 #     aa = [1, 2,3]
